@@ -3,11 +3,11 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION = "eu-north-1"
-        ECR_REGISTRY = "540553462149.dkr.ecr.eu-north-1.amazonaws.com"
+        AWS_REGION = "us-east-1"
+        ECR_REGISTRY = "177203142049.dkr.ecr.us-east-1.amazonaws.com"
         ECR_REPOSITORY = "my-app"
-        IMAGE_NAME = "540553462149.dkr.ecr.eu-north-1.amazonaws.com/my-app"
-        CONTAINER_NAME = "java-container"
+        IMAGE_NAME = "177203142049.dkr.ecr.us-east-1.amazonaws.com/my-app"
+        CONTAINER_NAME = "huzef-java"
     }
 
     stages {
@@ -15,7 +15,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 git branch: 'master',
-                    url: 'https://github.com/devivaraprasadgannavarapu/java-standalone.git'
+                    url: 'https://github.com/huzefa-2/java-standalone.git'
             }
         }
 
