@@ -12,13 +12,6 @@ pipeline {
 
     stages {
 
-        stage('Checkout') {
-            steps {
-                git branch: 'master',
-                    url: 'https://github.com/huzefa-2/java-standalone.git'
-            }
-        }
-
         stage('Build') {
             steps {
                 sh '''
