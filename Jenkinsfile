@@ -1,60 +1,214 @@
 pipeline {
-
-    agent any
+    agent none
 
     environment {
-        AWS_REGION = "us-east-1"
-        ECR_REGISTRY = "177203142049.dkr.ecr.us-east-1.amazonaws.com"
-        ECR_REPOSITORY = "my-app"
-        IMAGE_NAME = "177203142049.dkr.ecr.us-east-1.amazonaws.com/my-app"
-        CONTAINER_NAME = "huzef-java"
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '177203142049'
+
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO       = "${ECR_REGISTRY}/java-webapp"
+        IMAGE_TAG      = "v${BUILD_NUMBER}"
+
+        SONAR_HOST_URL = 'http://54.163.200.53:9000'
     }
 
     stages {
 
-        stage('Build') {
+        stage('Checkout & Maven Build') {
+            agent { label 'sonarqube' }
+
             steps {
+                deleteDir()
+
+                git branch: 'master',
+                    url: 'https://github.com/huzefa-2/java-standalone.git'
+
                 sh '''
-                    mvn clean package
+                    echo "===== CHECKOUT ====="
+                    ls -la
+
+                    echo "===== JAVA ====="
+                    java -version
+
+                    echo "===== MAVEN ====="
+                    mvn -version
+
+                    echo "===== MAVEN BUILD ====="
+                    mvn clean package -DskipTests
+                '''
+
+                stash name: 'source-code',
+                      includes: '**/*',
+                      useDefaultExcludes: false
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            agent { label 'sonarqube' }
+
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    withCredentials([
+                        string(
+                            credentialsId: 'sonar-token',
+                            variable: 'SONAR_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            echo "===== SONARQUBE ANALYSIS ====="
+
+                            /opt/sonar-scanner/bin/sonar-scanner \
+                              -Dsonar.projectKey=docker-sample-java-webapp \
+                              -Dsonar.sources=src \
+                              -Dsonar.java.binaries=target/classes \
+                              -Dsonar.host.url=$SONAR_HOST_URL \
+                              -Dsonar.token=$SONAR_TOKEN
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            agent none
+
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            agent { label 'docker-worker' }
+
+            steps {
+                deleteDir()
+
+                unstash 'source-code'
+
+                sh '''
+                    echo "===== DOCKER BUILD ====="
+
+                    docker build \
+                      -t ${ECR_REPO}:${IMAGE_TAG} .
+
+                    echo "===== SAVE IMAGE ====="
+
+                    docker save \
+                      ${ECR_REPO}:${IMAGE_TAG} \
+                      -o image.tar
+                '''
+
+                stash name: 'docker-image',
+                      includes: 'image.tar',
+                      useDefaultExcludes: false
+            }
+        }
+
+        stage('Trivy Scan') {
+            agent { label 'trivy' }
+
+            steps {
+                deleteDir()
+
+                unstash 'docker-image'
+
+                sh '''
+                    echo "===== TRIVY SCAN ====="
+
+                    mkdir -p trivy-tmp
+
+                    export TMPDIR=$PWD/trivy-tmp
+                    export TRIVY_CACHE_DIR=$PWD/trivy-tmp
+
+                    trivy image \
+                      --input image.tar \
+                      --severity HIGH,CRITICAL \
+                      --exit-code 1
                 '''
             }
         }
 
-        stage('Docker Build') {
-            steps {
-                sh '''
-                    docker build -t java-app:latest .
-                '''
-            }
-        }
+        stage('Push Image to ECR') {
+            agent { label 'docker-worker' }
 
-        stage('Push to Amazon ECR') {
             steps {
+                deleteDir()
+
+                unstash 'docker-image'
+
                 sh '''
-                    aws ecr get-login-password --region $AWS_REGION | \
+                    echo "===== LOAD IMAGE ====="
+
+                    docker load -i image.tar
+
+                    echo "===== AWS IDENTITY ====="
+
+                    aws sts get-caller-identity
+
+                    echo "===== ECR LOGIN ====="
+
+                    aws ecr get-login-password \
+                      --region ${AWS_REGION} | \
                     docker login \
-                    --username AWS \
-                    --password-stdin $ECR_REGISTRY
+                      --username AWS \
+                      --password-stdin ${ECR_REGISTRY}
 
-                    docker tag java-app:latest $IMAGE_NAME:latest
+                    echo "===== PUSH IMAGE ====="
 
-                    docker push $IMAGE_NAME:latest
+                    docker push ${ECR_REPO}:${IMAGE_TAG}
                 '''
             }
         }
 
-        stage('Deploy Docker Container') {
+        stage('Pull Image from ECR') {
+            agent { label 'docker-worker' }
+
             steps {
                 sh '''
-                    docker pull $IMAGE_NAME:latest
+                    echo "===== ECR LOGIN ====="
 
-                    docker stop $CONTAINER_NAME || true
-                    docker rm $CONTAINER_NAME || true
+                    aws ecr get-login-password \
+                      --region ${AWS_REGION} | \
+                    docker login \
+                      --username AWS \
+                      --password-stdin ${ECR_REGISTRY}
+
+                    echo "===== PULL IMAGE ====="
+
+                    docker pull ${ECR_REPO}:${IMAGE_TAG}
+                '''
+            }
+        }
+
+        stage('Deploy Application') {
+            agent { label 'docker-worker' }
+
+            steps {
+                sh '''
+                    echo "===== REMOVE OLD CONTAINER ====="
+
+                    docker rm -f java-webapp-container || true
+
+                    echo "===== START NEW CONTAINER ====="
 
                     docker run -d \
-                        --name $CONTAINER_NAME \
-                        -p 8081:8080 \
-                        $IMAGE_NAME:latest
+                      --name java-webapp-container \
+                      -p 8080:8080 \
+                      ${ECR_REPO}:${IMAGE_TAG}
+
+                    echo "===== CONTAINER STATUS ====="
+
+                    docker ps
+
+                    echo "===== APPLICATION LOGS ====="
+
+                    sleep 5
+
+                    docker logs \
+                      --tail 50 \
+                      java-webapp-container
                 '''
             }
         }
@@ -62,11 +216,16 @@ pipeline {
 
     post {
         success {
-            echo 'CI/CD Pipeline completed successfully!'
+            echo '======================================'
+            echo 'PIPELINE SUCCESSFUL'
+            echo '======================================'
         }
 
         failure {
-            echo 'CI/CD Pipeline failed. Check the console output.'
+            echo '======================================'
+            echo 'PIPELINE FAILED'
+            echo 'Check the failed stage in Console Output.'
+            echo '======================================'
         }
     }
 }
