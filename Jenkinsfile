@@ -10,23 +10,32 @@ pipeline {
         IMAGE_TAG      = "v${BUILD_NUMBER}"
 
         SONAR_HOST_URL = 'http://54.163.200.53:9000'
+
+        K8S_NAMESPACE  = 'java-webapp'
+        K8S_DEPLOYMENT = 'java-webapp'
     }
 
     stages {
 
-        stage('Checkout & Maven Build') {
+        stage('Checkout') {
             agent { label 'sonarqube' }
 
             steps {
-                deleteDir()
-
                 git branch: 'master',
                     url: 'https://github.com/huzefa-2/java-standalone.git'
 
                 sh '''
                     echo "===== CHECKOUT ====="
                     ls -la
+                '''
+            }
+        }
 
+        stage('Maven Build') {
+            agent { label 'sonarqube' }
+
+            steps {
+                sh '''
                     echo "===== JAVA ====="
                     java -version
 
@@ -36,10 +45,6 @@ pipeline {
                     echo "===== MAVEN BUILD ====="
                     mvn clean package -DskipTests
                 '''
-
-                stash name: 'source-code',
-                      includes: '**/*',
-                      useDefaultExcludes: false
             }
         }
 
@@ -48,15 +53,15 @@ pipeline {
 
             steps {
                 withSonarQubeEnv('SonarQube') {
+
                     withCredentials([
                         string(
                             credentialsId: 'sonar-token',
                             variable: 'SONAR_TOKEN'
                         )
                     ]) {
-                        sh '''
-                            echo "===== SONARQUBE ANALYSIS ====="
 
+                        sh '''
                             /opt/sonar-scanner/bin/sonar-scanner \
                               -Dsonar.projectKey=docker-sample-java-webapp \
                               -Dsonar.sources=src \
@@ -83,11 +88,14 @@ pipeline {
             agent { label 'docker-worker' }
 
             steps {
-                deleteDir()
 
-                unstash 'source-code'
+                git branch: 'master',
+                    url: 'https://github.com/huzefa-2/java-standalone.git'
 
                 sh '''
+                    echo "===== DOCKER VERSION ====="
+                    docker --version
+
                     echo "===== DOCKER BUILD ====="
 
                     docker build \
@@ -101,8 +109,8 @@ pipeline {
                 '''
 
                 stash name: 'docker-image',
-                      includes: 'image.tar',
-                      useDefaultExcludes: false
+                    includes: 'image.tar',
+                    useDefaultExcludes: false
             }
         }
 
@@ -110,17 +118,21 @@ pipeline {
             agent { label 'trivy' }
 
             steps {
+
                 deleteDir()
 
                 unstash 'docker-image'
 
                 sh '''
-                    echo "===== TRIVY SCAN ====="
+                    echo "===== TRIVY VERSION ====="
+                    trivy --version
 
                     mkdir -p trivy-tmp
 
                     export TMPDIR=$PWD/trivy-tmp
                     export TRIVY_CACHE_DIR=$PWD/trivy-tmp
+
+                    echo "===== TRIVY SCAN ====="
 
                     trivy image \
                       --input image.tar \
@@ -134,6 +146,7 @@ pipeline {
             agent { label 'docker-worker' }
 
             steps {
+
                 deleteDir()
 
                 unstash 'docker-image'
@@ -162,70 +175,123 @@ pipeline {
             }
         }
 
-        stage('Pull Image from ECR') {
+        stage('Verify EKS Access') {
             agent { label 'docker-worker' }
 
             steps {
+
                 sh '''
-                    echo "===== ECR LOGIN ====="
+                    echo "===== AWS IDENTITY ====="
 
-                    aws ecr get-login-password \
-                      --region ${AWS_REGION} | \
-                    docker login \
-                      --username AWS \
-                      --password-stdin ${ECR_REGISTRY}
+                    aws sts get-caller-identity
 
-                    echo "===== PULL IMAGE ====="
+                    echo "===== KUBECTL ====="
 
-                    docker pull ${ECR_REPO}:${IMAGE_TAG}
+                    kubectl version --client
+
+                    echo "===== EKS NODES ====="
+
+                    kubectl get nodes
+
+                    echo "===== NAMESPACE ====="
+
+                    kubectl get namespace ${K8S_NAMESPACE}
                 '''
             }
         }
 
-        stage('Deploy Application') {
+        stage('Deploy to Kubernetes') {
             agent { label 'docker-worker' }
 
             steps {
+
+                deleteDir()
+
+                git branch: 'master',
+                    url: 'https://github.com/huzefa-2/java-standalone.git'
+
                 sh '''
-                    echo "===== REMOVE OLD CONTAINER ====="
+                    echo "===== KUBERNETES DEPLOYMENT ====="
 
-                    docker rm -f java-webapp-container || true
+                    echo "===== APPLY SERVICE ====="
 
-                    echo "===== START NEW CONTAINER ====="
+                    kubectl apply \
+                      -f k8s/service.yaml
 
-                    docker run -d \
-                      --name java-webapp-container \
-                      -p 8080:8080 \
-                      ${ECR_REPO}:${IMAGE_TAG}
+                    echo "===== UPDATE IMAGE ====="
 
-                    echo "===== CONTAINER STATUS ====="
+                    sed "s|PLACEHOLDER|${IMAGE_TAG}|g" \
+                      k8s/deployment.yaml \
+                      > deployment-${BUILD_NUMBER}.yaml
 
-                    docker ps
+                    echo "===== APPLY DEPLOYMENT ====="
 
-                    echo "===== APPLICATION LOGS ====="
+                    kubectl apply \
+                      -f deployment-${BUILD_NUMBER}.yaml
 
-                    sleep 5
+                    echo "===== ROLLOUT STATUS ====="
 
-                    docker logs \
-                      --tail 50 \
-                      java-webapp-container
+                    kubectl rollout status \
+                      deployment/${K8S_DEPLOYMENT} \
+                      -n ${K8S_NAMESPACE} \
+                      --timeout=5m
+                '''
+            }
+        }
+
+        stage('Verify Application') {
+            agent { label 'docker-worker' }
+
+            steps {
+
+                sh '''
+                    echo "===== DEPLOYMENT ====="
+
+                    kubectl get deployment \
+                      -n ${K8S_NAMESPACE}
+
+                    echo "===== PODS ====="
+
+                    kubectl get pods \
+                      -n ${K8S_NAMESPACE} \
+                      -o wide
+
+                    echo "===== SERVICE ====="
+
+                    kubectl get svc \
+                      -n ${K8S_NAMESPACE}
                 '''
             }
         }
     }
 
     post {
+
         success {
-            echo '======================================'
-            echo 'PIPELINE SUCCESSFUL'
-            echo '======================================'
+            echo '''
+            =========================================
+                 PIPELINE SUCCESSFUL
+            =========================================
+
+            Application successfully:
+
+            Git → Maven → SonarQube → Trivy
+                → ECR → EKS → Kubernetes
+
+            =========================================
+            '''
         }
 
         failure {
-            echo '======================================'
-            echo 'PIPELINE FAILED'
-            echo 'Check the failed stage in Console Output.'
-            echo '======================================'
+            echo '''
+            =========================================
+                    PIPELINE FAILED
+            =========================================
+
+            Check the failed stage above.
+
+            =========================================
+            '''
         }
     }
 }
