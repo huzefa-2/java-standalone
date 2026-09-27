@@ -9,7 +9,7 @@ pipeline {
         ECR_REPO       = "${ECR_REGISTRY}/java-webapp"
         IMAGE_TAG      = "v${BUILD_NUMBER}"
 
-        SONAR_HOST_URL = 'http://54.163.200.53:9000'
+        SONAR_HOST_URL = 'http://54.92.217.177:9000'
 
         K8S_NAMESPACE  = 'java-webapp'
         K8S_DEPLOYMENT = 'java-webapp'
